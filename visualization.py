@@ -42,6 +42,12 @@ ONTIME_COLOR = (100, 255, 100)
 HEADER_COLOR = (160, 180, 220)
 EXPORT_COLOR = (80, 150, 120)
 
+COLOR_PAS_L8 = (60, 140, 220)
+COLOR_PAS_L73 = (100, 200, 100)
+COLOR_PAS_IC = (220, 60, 60)
+COLOR_PAS_POLNOC = (180, 200, 255)
+COLOR_PAS_POLUDNIE = (255, 200, 150)
+
 
 class TrackLayout:
     def __init__(self, ox: int, oy: int, scale: float = 1.0):
@@ -122,6 +128,210 @@ class TrackLayout:
         return [(self.kop_ox - 30, y), (self.kop_ox, y), (self.kop_ox + self.kop_track_len, y)]
 
 
+_PAS_KEYS = ["L8_Polnoc", "L8_Poludnie", "L73_Polnoc", "L73_Poludnie", "IC_Polnoc", "IC_Poludnie"]
+
+_PAS_GROUPS = [
+    ("L8",  [("L8_Polnoc",   "→ Pol", COLOR_PAS_POLNOC),
+             ("L8_Poludnie", "→ Pld", COLOR_PAS_POLUDNIE)],  COLOR_PAS_L8),
+    ("L73", [("L73_Polnoc",  "→ Pol", COLOR_PAS_POLNOC),
+             ("L73_Poludnie","→ Pld", COLOR_PAS_POLUDNIE)],  COLOR_PAS_L73),
+    ("IC",  [("IC_Polnoc",   "→ Pol", COLOR_PAS_POLNOC),
+             ("IC_Poludnie", "→ Pld", COLOR_PAS_POLUDNIE)],  COLOR_PAS_IC),
+]
+
+
+class PassengerFlowPanel:
+    def __init__(self, x: int, y: int, w: int, h: int):
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.font_sm = None
+        self.font_md = None
+        self.font_hd = None
+        self._smooth_vals = {k: 0.0 for k in _PAS_KEYS}
+
+    def _init_fonts(self):
+        if self.font_sm is None:
+            self.font_sm = pygame.font.SysFont("consolas", 11)
+            self.font_md = pygame.font.SysFont("consolas", 12, bold=True)
+            self.font_hd = pygame.font.SysFont("consolas", 13, bold=True)
+
+    def _pt(self, screen, font, text, x, y, color):
+        screen.blit(font.render(text, True, color), (x, y))
+
+    def _bar(self, screen, x, y, w, h, val, max_val, color, bg=(30, 33, 38)):
+        pygame.draw.rect(screen, bg, (x, y, w, h))
+        if val > 0 and max_val > 0:
+            fw = max(3, int(w * min(1.0, val / max_val)))
+            pygame.draw.rect(screen, color, (x, y, fw, h))
+        pygame.draw.rect(screen, (70, 75, 85), (x, y, w, h), 1)
+
+    def draw(self, screen: pygame.Surface, engine: SimulationEngine):
+        self._init_fonts()
+
+        pygame.draw.rect(screen, PANEL_BG, (self.x, self.y, self.w, self.h))
+        pygame.draw.rect(screen, (55, 60, 72), (self.x, self.y, self.w, self.h), 1)
+
+        summary = engine.get_pasazerowie_summary()
+        for k in _PAS_KEYS:
+            target = float(summary.get(k, 0))
+            self._smooth_vals[k] = self._smooth_vals[k] * 0.85 + target * 0.15
+
+        total = sum(summary.values())
+        mx = max(max(summary.values(), default=1), 1)
+
+        pad = 8
+        x = self.x + pad
+        y = self.y + 6
+        inner_w = self.w - pad * 2
+
+        header_surf = self.font_hd.render("PASAZEROWIE  NA  PERONACH", True, HEADER_COLOR)
+        screen.blit(header_surf, (self.x + (self.w - header_surf.get_width()) // 2, y))
+        y += 18
+
+        pygame.draw.line(screen, (55, 60, 72), (self.x + 4, y), (self.x + self.w - 4, y), 1)
+        y += 5
+
+        total_col = DELAY_COLOR if total > 40 else (255, 200, 80) if total > 15 else ONTIME_COLOR
+        self._pt(screen, self.font_md, f"Lacznie oczekujacych: {total}", x, y, total_col)
+        y += 16
+
+        label_w = 36
+        dir_w = 28
+        bar_w = inner_w - label_w - dir_w - 28
+        cnt_w = 26
+        row_h = 17
+        grp_gap = 8
+
+        for grp_name, entries, grp_color in _PAS_GROUPS:
+            grp_total = sum(summary.get(k, 0) for k, _, _ in entries)
+
+            grp_bg = (28, 32, 42)
+            grp_h = len(entries) * row_h + 6
+            pygame.draw.rect(screen, grp_bg, (x - 2, y - 1, inner_w + 4, grp_h + 2))
+            pygame.draw.rect(screen, _blend_colors(grp_color, (0,0,0), 0.6),
+                             (x - 2, y - 1, inner_w + 4, grp_h + 2), 1)
+
+            lbl_surf = self.font_md.render(grp_name, True, grp_color)
+            screen.blit(lbl_surf, (x + 2, y + (grp_h - lbl_surf.get_height()) // 2))
+
+            sub_x = x + label_w
+            for i, (key, dir_label, dir_color) in enumerate(entries):
+                ry = y + 3 + i * row_h
+                count = summary.get(key, 0)
+                smooth = self._smooth_vals[key]
+
+                self._pt(screen, self.font_sm, dir_label, sub_x, ry + 2, dir_color)
+                bx = sub_x + dir_w
+                bar_color = _blend_colors(grp_color, dir_color, 0.45)
+                self._bar(screen, bx, ry + 3, bar_w, row_h - 6, smooth, max(mx, 1), bar_color)
+
+                if count > 0:
+                    cnt_color = DELAY_COLOR if count > 20 else (255, 210, 80) if count > 8 else ONTIME_COLOR
+                else:
+                    cnt_color = (55, 60, 70)
+                cnt_str = str(count)
+                cnt_surf = self.font_sm.render(cnt_str, True, cnt_color)
+                screen.blit(cnt_surf, (bx + bar_w + 4, ry + 2))
+
+            y += grp_h + grp_gap
+
+        pygame.draw.line(screen, (55, 60, 72), (self.x + 4, y), (self.x + self.w - 4, y), 1)
+        y += 6
+
+        self._pt(screen, self.font_md, "Przeplyw w czasie", x, y, HEADER_COLOR)
+        y += 14
+
+        history = engine.historia_liczby_pasazerow
+        chart_h = 48
+        chart_w = inner_w
+        pygame.draw.rect(screen, (16, 19, 24), (x, y, chart_w, chart_h))
+        pygame.draw.rect(screen, (50, 55, 65), (x, y, chart_w, chart_h), 1)
+
+        if len(history) >= 2:
+            n = min(len(history), chart_w)
+            recent = history[-n:]
+            all_totals = [sum(r.get(k, 0) for k in _PAS_KEYS) for r in recent]
+            hist_max = max(max(all_totals), 1)
+
+            bar_cw = max(1, chart_w // n)
+            for i, (row, tot) in enumerate(zip(recent, all_totals)):
+                if tot == 0:
+                    continue
+                bh = max(1, int((tot / hist_max) * (chart_h - 4)))
+                bx2 = x + i * bar_cw
+                ratio = tot / hist_max
+                r_col = int(40 + 180 * ratio)
+                g_col = int(120 - 80 * ratio)
+                b_col = int(180 - 60 * ratio)
+                pygame.draw.rect(screen, (r_col, g_col, b_col),
+                                 (bx2, y + chart_h - bh - 2, bar_cw, bh))
+
+            ref_y = y + chart_h - int((hist_max * 0.5) / hist_max * (chart_h - 4)) - 2
+            pygame.draw.line(screen, (55, 60, 70), (x, ref_y), (x + chart_w, ref_y), 1)
+            self._pt(screen, self.font_sm, f"{hist_max//2}", x + 2, ref_y - 9, (80, 85, 95))
+            self._pt(screen, self.font_sm, f"{hist_max}", x + 2, y + 1, (80, 85, 95))
+
+        y += chart_h + 8
+
+        pygame.draw.line(screen, (55, 60, 72), (self.x + 4, y - 4), (self.x + self.w - 4, y - 4), 1)
+
+        self._pt(screen, self.font_md, "Analiza przeplywu", x, y, HEADER_COLOR)
+        y += 14
+
+        done = engine.pociagi_zakonczone
+        pas_trains = [p for p in done if p.typ != "Towarowy" and p.kategoria != "Przelotowy"]
+        if pas_trains:
+            total_boarded = sum(p.pasazerowie_wsiadli for p in pas_trains)
+            self._pt(screen, self.font_sm, f"Obsluzone lacznie:  {total_boarded} os.", x, y, WHITE)
+            y += 13
+
+            for linia, col in [("L8", COLOR_PAS_L8), ("L73", COLOR_PAS_L73)]:
+                sub = [p for p in pas_trains if p.linia == linia]
+                if sub:
+                    avg_b = sum(p.pasazerowie_wsiadli for p in sub) / len(sub)
+                    self._pt(screen, self.font_sm,
+                             f"  {linia} Regio:  sr {avg_b:.0f} os/poc ({len(sub)} poc)",
+                             x, y, col)
+                    y += 12
+
+            ic_z = [p for p in done if p.typ == "IC" and p.kategoria == "Zatrzymujacy"]
+            if ic_z:
+                avg_ic = sum(p.pasazerowie_wsiadli for p in ic_z) / len(ic_z)
+                self._pt(screen, self.font_sm,
+                         f"  IC Zatrz.: sr {avg_ic:.0f} os/poc ({len(ic_z)} poc)",
+                         x, y, COLOR_PAS_IC)
+                y += 12
+
+            if engine.pasazer_log:
+                waits = [e["czas_oczekiwania"] for e in engine.pasazer_log]
+                avg_w = sum(waits) / len(waits)
+                max_w = max(waits)
+                self._pt(screen, self.font_sm,
+                         f"  Sr. oczekiw.: {avg_w:.1f} min", x, y, LABEL_COLOR)
+                y += 12
+                self._pt(screen, self.font_sm,
+                         f"  Max oczekiw.: {max_w:.1f} min", x, y,
+                         DELAY_COLOR if max_w > 10 else LABEL_COLOR)
+                y += 12
+
+            delayed = [(p.opoznienie, p.pasazerowie_wsiadli, p.linia)
+                       for p in pas_trains if p.opoznienie > 2]
+            if delayed:
+                delayed.sort(reverse=True)
+                dd, dp, dl = delayed[0]
+                self._pt(screen, self.font_sm,
+                         f"  Najgorsze: {dl} +{dd:.0f}min {dp}os",
+                         x, y, DELAY_COLOR)
+        else:
+            self._pt(screen, self.font_sm, "Oczekiwanie na dane...", x, y, GRAY)
+
+
+def _blend_colors(c1, c2, t):
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
 class Renderer:
     def __init__(self, screen: pygame.Surface, layout: TrackLayout):
         self.screen = screen
@@ -131,6 +341,15 @@ class Renderer:
         self.font_lg = pygame.font.SysFont("consolas", 18, bold=True)
         self.font_title = pygame.font.SysFont("consolas", 20, bold=True)
         self.export_button_rect = None
+        self._passenger_panel = None
+
+    def _get_passenger_panel(self) -> PassengerFlowPanel:
+        if self._passenger_panel is None:
+            sw, sh = self.screen.get_size()
+            panel_w = 220
+            panel_x = sw - 320 - panel_w - 6
+            self._passenger_panel = PassengerFlowPanel(panel_x, 10, panel_w, sh - 20)
+        return self._passenger_panel
 
     def draw_tracks(self):
         L = self.L
@@ -158,23 +377,24 @@ class Renderer:
         for i in range(3):
             pygame.draw.lines(self.screen, TRACK_KOP_COLOR, False, L.path_kopalnia_track(i), 3)
 
-        self._label("568", L.x_568 - 26, L.y_tor_mid - 6, TRACK_568_COLOR)
-        self._label("T1", L.x_tor1 - 6, L.y_tor_n - 18, LABEL_COLOR)
-        self._label("T2", L.x_tor2 - 6, L.y_tor_n - 18, LABEL_COLOR)
-        self._label("T3", L.x_tor3 - 6, L.y_tor_n - 18, TRACK_L73_COLOR)
-        self._label("T4", L.x_tor4 - 6, L.y_tor_n - 18, TRACK_L73_COLOR)
-        self._label("Gl.N", L.x_main + 12, L.y_jct_n - 6, LIGHT_GRAY)
-        self._label("Gl.S", L.x_main + 12, L.y_jct_s - 6, LIGHT_GRAY)
+        self._label_bg("568", L.x_568 - 26, L.y_tor_mid - 6, TRACK_568_COLOR)
+        self._label_bg("T1", L.x_tor1 - 6, L.y_tor_n - 20, LABEL_COLOR)
+        self._label_bg("T2", L.x_tor2 - 6, L.y_tor_n - 20, LABEL_COLOR)
+        self._label_bg("T3", L.x_tor3 - 6, L.y_tor_n - 20, TRACK_L73_COLOR)
+        self._label_bg("T4", L.x_tor4 - 6, L.y_tor_n - 20, TRACK_L73_COLOR)
+        self._label_bg("Gl.N", L.x_main + 14, L.y_jct_n - 8, LIGHT_GRAY)
+        self._label_bg("Gl.S", L.x_main + 14, L.y_jct_s + 4, LIGHT_GRAY)
         self._label_md("POLNOC", L.x_main - 28, L.y_top - 60, LABEL_COLOR)
         self._label_md("POLUDNIE", L.x_main - 32, L.y_bot + 45, LABEL_COLOR)
-        self._label("L73", L.x_l73_far - 10, L.y_bot + 45, TRACK_L73_COLOR)
-        self._label("L8", (L.x_tor1 + L.x_tor2) // 2 - 6, L.y_tor_s + 8, TRACK_COLOR)
-        self._label("L73", (L.x_tor3 + L.x_tor4) // 2 - 8, L.y_tor_s + 8, TRACK_L73_COLOR)
+        self._label_bg("L73", L.x_l73_far - 10, L.y_bot + 45, TRACK_L73_COLOR)
+        self._label_bg("L8", (L.x_tor1 + L.x_tor2) // 2 - 6, L.y_tor_s + 10, TRACK_COLOR)
+        self._label_bg("L73", (L.x_tor3 + L.x_tor4) // 2 - 8, L.y_tor_s + 10, TRACK_L73_COLOR)
 
-        self._label_lg("KOPALNIA TRZUSKAWICA", L.kop_ox - 20, L.kop_oy - 50, TRACK_KOP_COLOR)
+        self._label_bg("KOPALNIA TRZUSKAWICA", L.kop_ox - 20, L.kop_oy - 52, TRACK_KOP_COLOR,
+                       font=self.font_lg)
         for i in range(3):
             y = L.kop_oy + i * L.kop_track_spacing
-            self._label(f"K{i}", L.kop_ox + L.kop_track_len + 8, y - 6, TRACK_KOP_COLOR)
+            self._label_bg(f"K{i}", L.kop_ox + L.kop_track_len + 10, y - 6, TRACK_KOP_COLOR)
 
     def _draw_platform(self, label, x_left, x_right):
         L = self.L
@@ -208,7 +428,28 @@ class Renderer:
         _sig(L.x_main - 25, L.y_jct_s, engine.semafor_s_red)
         _sig(L.x_main + 25, L.y_jct_s - 10, engine.semafor_kop_red)
 
-        _sig(L.kop_ox - 25, L.kop_oy + 40, engine.semafor_kop_red)
+        _sig(L.kop_ox - 25, L.kop_oy + 40, engine.semafor_kop_out_red)
+
+        do_kop = engine.szlak_kopalnia.pociagi_do_kopalni
+        z_kop  = engine.szlak_kopalnia.pociagi_z_kopalni
+        cap    = engine.szlak_kopalnia.pojemnosc
+        kop_branch_mid_x = L.x_main + (L.kop_ox - 30 - L.x_main) // 3
+        kop_branch_mid_y = L.y_jct_s + (L.kop_oy + 30 - L.y_jct_s) // 3
+        lbl_x = kop_branch_mid_x - 18
+        lbl_y = kop_branch_mid_y - 34
+        if do_kop > 0:
+            lbl = f">kop {do_kop}/{cap}"
+            surf = self.font_sm.render(lbl, True, TRACK_KOP_COLOR)
+            pygame.draw.rect(self.screen, (12, 15, 20),
+                             (lbl_x - 2, lbl_y - 1, surf.get_width() + 4, surf.get_height() + 2))
+            self.screen.blit(surf, (lbl_x, lbl_y))
+            lbl_y += surf.get_height() + 3
+        if z_kop > 0:
+            lbl = f"<st {z_kop}"
+            surf = self.font_sm.render(lbl, True, (200, 200, 100))
+            pygame.draw.rect(self.screen, (12, 15, 20),
+                             (lbl_x - 2, lbl_y - 1, surf.get_width() + 4, surf.get_height() + 2))
+            self.screen.blit(surf, (lbl_x, lbl_y))
 
     def _pos_angle_with_offset(self, path, t, offset_px):
         if not path: return (0, 0), 90.0
@@ -456,6 +697,73 @@ class Renderer:
                 pos, _ = self._pos_angle_with_offset(path, 1.0, offset)
                 self.draw_queued_dot(vs["train"], pos)
 
+    def draw_platform_passengers(self, engine: SimulationEngine):
+        L = self.L
+        summary = engine.get_pasazerowie_summary()
+        MAX_PAX = 30
+
+        zones = [
+            (L.x_tor1, L.x_tor2, [
+                ("L8_Polnoc",   "L8N", COLOR_PAS_L8,  COLOR_PAS_POLNOC),
+                ("L8_Poludnie", "L8S", COLOR_PAS_L8,  COLOR_PAS_POLUDNIE),
+                ("IC_Polnoc",   "ICN", COLOR_PAS_IC,  COLOR_PAS_POLNOC),
+                ("IC_Poludnie", "ICS", COLOR_PAS_IC,  COLOR_PAS_POLUDNIE),
+            ]),
+            (L.x_tor3, L.x_tor4, [
+                ("L73_Polnoc",   "73N", COLOR_PAS_L73, COLOR_PAS_POLNOC),
+                ("L73_Poludnie", "73S", COLOR_PAS_L73, COLOR_PAS_POLUDNIE),
+            ]),
+        ]
+
+        for x_left, x_right, entries in zones:
+            margin = int(6 * L.s)
+            px = x_left + margin
+            pw = (x_right - x_left) - 2 * margin
+            ph = int((L.y_tor_s - L.y_tor_n) * 0.7)
+            py = L.y_tor_n + int((L.y_tor_s - L.y_tor_n) * 0.15)
+            n = len(entries)
+            row_h = ph // n
+
+            for i, (key, short_lbl, linia_col, kier_col) in enumerate(entries):
+                count = summary.get(key, 0)
+                ry = py + i * row_h
+                rh = row_h - 2
+                blend = _blend_colors(linia_col, kier_col, 0.5)
+
+                # Termometr – pasek wypelnienia od dolu, proporcjonalny do liczby pasazerow
+                if count > 0:
+                    fill_h = max(2, int(rh * min(1.0, count / MAX_PAX)))
+                    pygame.draw.rect(self.screen,
+                                     _blend_colors(blend, (0, 0, 0), 0.42),
+                                     (px, ry + rh - fill_h, pw, fill_h))
+
+                # Lewy pasek – kolor linii
+                pygame.draw.rect(self.screen, linia_col, (px, ry, 3, rh))
+
+                # Ramka wiersza
+                pygame.draw.rect(self.screen,
+                                 _blend_colors(blend, (0, 0, 0), 0.65),
+                                 (px, ry, pw, rh), 1)
+
+                lbl_col = (_blend_colors(blend, WHITE, 0.55) if count > 0
+                           else (48, 52, 62))
+                lbl_surf = self.font_sm.render(short_lbl, True, lbl_col)
+                lx = px - lbl_surf.get_width() - 4
+                ly = ry + (rh - lbl_surf.get_height()) // 2
+                pygame.draw.rect(self.screen, (12, 15, 20),
+                                 (lx - 1, ly - 1, lbl_surf.get_width() + 2, lbl_surf.get_height() + 2))
+                self.screen.blit(lbl_surf, (lx, ly))
+
+                # Liczba pasazerow wewnątrz komorki
+                if count > 0:
+                    cnt_col = (DELAY_COLOR if count > 20
+                               else (255, 200, 80) if count > 8
+                               else ONTIME_COLOR)
+                    cnt_surf = self.font_sm.render(str(count), True, cnt_col)
+                    cx = px + pw - cnt_surf.get_width() - 2
+                    cy = ry + (rh - cnt_surf.get_height()) // 2
+                    self.screen.blit(cnt_surf, (cx, cy))
+
     def draw_trucks(self, engine: SimulationEngine):
         L = self.L
         loco_w = int(20 * L.s)
@@ -542,7 +850,8 @@ class Renderer:
             ("Tor 3 (L73)", engine.track_busy("tor3")),
             ("Tor 4 (L73)", engine.track_busy("tor4")),
             ("Tor 568", engine.track_busy("568")),
-            ("Szlak Kopalni", engine.track_busy("kop_szlak")),
+            (f"Kop->Wjazd ({engine.szlak_kopalnia.pociagi_do_kopalni}/{engine.szlak_kopalnia.pojemnosc})", engine.semafor_kop_red),
+            (f"Kop<-Wyjazd ({engine.szlak_kopalnia.pociagi_z_kopalni})", engine.semafor_kop_out_red),
         ]
         for name, busy in resources:
             c = SIGNAL_RED if busy else SIGNAL_GREEN
@@ -602,9 +911,16 @@ class Renderer:
         surf = self.font_md.render("[X] Eksport do Excel", True, WHITE)
         self.screen.blit(surf, (btn.x + (btn.w - surf.get_width()) // 2, btn.y + 5))
 
+    def draw_passenger_flow_panel(self, engine: SimulationEngine):
+        sw, sh = self.screen.get_size()
+        panel_w = 215
+        panel_x = sw - 320 - panel_w - 6
+        panel = PassengerFlowPanel(panel_x, 10, panel_w, sh - 20)
+        panel.draw(self.screen, engine)
+
     def draw_summary(self, engine: SimulationEngine, export_info: str = ""):
         sw, sh = self.screen.get_size()
-        pw, ph = 480, 400
+        pw, ph = 520, 460
         px, py = (sw - pw) // 2, (sh - ph) // 2
 
         overlay = pygame.Surface((sw, sh))
@@ -648,10 +964,45 @@ class Renderer:
             self._pt(self.font_md, f"Sredni czas oczekiwania:{avg_wait:.2f} min", x, y, LABEL_COLOR)
             y += 22
             self._pt(self.font_md, f"Pociagi opoznione:      {delayed_count} / {total}", x, y, LABEL_COLOR)
+            y += 30
+
+            pas_trains = [p for p in done if p.typ != "Towarowy"]
+            if pas_trains:
+                self._pt(self.font_md, "PASAZEROWIE", x, y, HEADER_COLOR)
+                y += 22
+                total_pas = sum(p.pasazerowie_wsiadli for p in pas_trains)
+                self._pt(self.font_md, f"Lacznie wsiadlo: {total_pas}", x + 15, y, WHITE)
+                y += 20
+
+                for linia, col in [("L8", COLOR_PAS_L8), ("L73", COLOR_PAS_L73)]:
+                    sub = [p for p in pas_trains if p.linia == linia and p.typ != "IC"]
+                    if sub:
+                        total_l = sum(p.pasazerowie_wsiadli for p in sub)
+                        avg_l = total_l / len(sub)
+                        self._pt(self.font_sm,
+                                 f"  {linia} Regio: {total_l} os. (sr {avg_l:.0f}/poc)",
+                                 x + 15, y, col)
+                        y += 18
+                ic_sub = [p for p in pas_trains if p.typ == "IC"]
+                if ic_sub:
+                    total_ic = sum(p.pasazerowie_wsiadli for p in ic_sub)
+                    avg_ic = total_ic / len(ic_sub)
+                    self._pt(self.font_sm,
+                             f"  IC: {total_ic} os. (sr {avg_ic:.0f}/poc)",
+                             x + 15, y, COLOR_PAS_IC)
+                    y += 18
+
+                total_log = len(engine.pasazer_log)
+                if total_log > 0:
+                    avg_wait_pas = sum(p["czas_oczekiwania"] for p in engine.pasazer_log) / total_log
+                    self._pt(self.font_sm,
+                             f"  Sr. czas oczekiwania pas.: {avg_wait_pas:.1f} min",
+                             x + 15, y, LABEL_COLOR)
+                    y += 18
         else:
             self._pt(self.font_md, "Brak obsluzonych pociagow.", x, y, GRAY)
 
-        y += 35
+        y += 15
         if export_info:
             self._pt(self.font_sm, export_info, x, y, ONTIME_COLOR)
             y += 20
@@ -662,6 +1013,12 @@ class Renderer:
 
     def _label(self, t, x, y, c):
         self._pt(self.font_sm, t, x, y, c)
+
+    def _label_bg(self, t, x, y, c, font=None, bg=(12, 15, 20)):
+        f = font or self.font_sm
+        surf = f.render(t, True, c)
+        pygame.draw.rect(self.screen, bg, (x - 2, y - 1, surf.get_width() + 4, surf.get_height() + 2))
+        self.screen.blit(surf, (x, y))
 
     def _label_md(self, t, x, y, c):
         self._pt(self.font_md, t, x, y, c)
@@ -695,6 +1052,9 @@ class EditorPanel:
             ("Wagon: mu [min]", "czas_wagon_mu", 0.2, 10.0, 0.2, True),
             ("Wagon: sigma [min]", "czas_wagon_sigma", 0.0, 5.0, 0.1, True),
             ("Udzial tow. na polnoc", "freight_north_ratio", 0.0, 1.0, 0.1, True),
+            ("Pas./min L8 Regio", "pasazerowie_per_min_l8", 0.1, 10.0, 0.1, True),
+            ("Pas./min L73", "pasazerowie_per_min_l73", 0.1, 10.0, 0.1, True),
+            ("Pas./min IC", "pasazerowie_per_min_ic", 0.1, 10.0, 0.1, True),
         ]
         self.buttons = []
 
@@ -744,7 +1104,7 @@ class EditorPanel:
         font_info = pygame.font.SysFont("consolas", 11)
         screen.blit(font_info.render("* Pociagi sa rozkladane rownomiernie w oknie czasu", True, GRAY), (x, y))
         y += 14
-        screen.blit(font_info.render("* Udzial tow. na polnoc: czesc pociagow z kopalni jedzie dalej na N", True, GRAY), (x, y))
+        screen.blit(font_info.render("* Pas./min: srednia liczba pasazerow przybywajacych na min", True, GRAY), (x, y))
 
         y += 24
         ab = pygame.Rect(px + pw // 2 - 90, y, 180, 30)
@@ -785,8 +1145,8 @@ def run_visualization():
     pygame.init()
 
     info = pygame.display.Info()
-    W = min(1500, info.current_w - 80)
-    H = min(850, info.current_h - 80)
+    W = min(1600, info.current_w - 80)
+    H = min(900, info.current_h - 80)
     screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
     pygame.display.set_caption("Symulacja Sitkowka Nowiny + Kopalnia Trzuskawica")
 
@@ -794,8 +1154,8 @@ def run_visualization():
     FPS = 60
 
     def make_layout(w, h):
-        s = min(w / 1050, h / 720) * 0.85
-        return TrackLayout(ox=int(w * 0.12), oy=int(h * 0.18), scale=s)
+        s = min(w / 1200, h / 720) * 0.78
+        return TrackLayout(ox=int(w * 0.20), oy=int(h * 0.18), scale=s)
 
     layout = make_layout(W, H)
     renderer = Renderer(screen, layout)
@@ -900,9 +1260,11 @@ def run_visualization():
 
         renderer.draw_tracks()
         renderer.draw_signals(engine)
+        renderer.draw_platform_passengers(engine)
         renderer.draw_trucks(engine)
         renderer.draw_trains(engine)
         renderer.draw_panel(engine, speed_mult, idle_speed_mult, active_speed_mult, paused, auto_speed)
+        renderer.draw_passenger_flow_panel(engine)
         renderer.draw_controls(editor.visible)
 
         if export_info:

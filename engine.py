@@ -39,9 +39,24 @@ class SimConfig:
 
     freight_north_ratio: float = 0.4
 
+    pasazerowie_per_min_l8: float = 0.6
+    pasazerowie_per_min_l73: float = 0.35
+    pasazerowie_per_min_ic: float = 0.9
+
     def copy(self):
         import copy
         return copy.copy(self)
+
+
+@dataclass
+class Pasazer:
+    id: int
+    linia: str
+    kierunek_odjazdu: str
+    czas_przybycia: float
+    pociag_docelowy_id: Optional[int] = None
+    czas_wyjazdu: Optional[float] = None
+    wsiadl: bool = False
 
 
 @dataclass
@@ -71,6 +86,9 @@ class Pociag:
     liczba_oczekiwan: int = 0
     wagony_obsluzone: int = 0
 
+    pasazerowie_wsiadli: int = 0
+    pasazerowie_wysiadli: int = 0
+
     def __post_init__(self):
         if self.typ == "Towarowy":
             self.cel_kopalni = random.choice(["zaladunek", "rozladunek"])
@@ -96,6 +114,70 @@ class TruckState:
     transfer_done: bool = False
 
 
+class SzlakKopalnia:
+    def __init__(self, env: simpy.Environment, pojemnosc_kopalni: int):
+        self.env = env
+        self.pojemnosc = pojemnosc_kopalni
+        self._kolejka_wejscia = simpy.PriorityResource(env, capacity=pojemnosc_kopalni)
+        self._kolejka_wyjscia = simpy.PriorityResource(env, capacity=pojemnosc_kopalni)
+        self._pociagi_na_szlaku_wejscie: set = set()
+        self._pociagi_na_szlaku_wyjscie: set = set()
+        self._uchwyty_wejscia: dict = {}
+        self._uchwyty_wyjscia: dict = {}
+
+    @property
+    def pociagi_w_drodze(self) -> int:
+        return len(self._pociagi_na_szlaku_wejscie) + len(self._pociagi_na_szlaku_wyjscie)
+
+    @property
+    def pociagi_do_kopalni(self) -> int:
+        return len(self._pociagi_na_szlaku_wejscie)
+
+    @property
+    def pociagi_z_kopalni(self) -> int:
+        return len(self._pociagi_na_szlaku_wyjscie)
+
+    @property
+    def semafor_wejscie_red(self) -> bool:
+        if len(self._pociagi_na_szlaku_wyjscie) > 0:
+            return True
+        if len(self._kolejka_wejscia.users) >= self.pojemnosc:
+            return True
+        return False
+
+    @property
+    def semafor_wyjscie_red(self) -> bool:
+        return len(self._pociagi_na_szlaku_wejscie) > 0
+
+    def wejdz(self, env, pociag, kopalnia_tory):
+        while len(self._pociagi_na_szlaku_wyjscie) > 0:
+            yield env.timeout(0.05)
+        req = self._kolejka_wejscia.request(priority=env.now)
+        yield req
+        self._uchwyty_wejscia[pociag.id] = req
+        self._pociagi_na_szlaku_wejscie.add(pociag.id)
+
+    def odnotuj_wjazd_na_teren(self, pociag_id: int):
+        req = self._uchwyty_wejscia.pop(pociag_id, None)
+        if req is not None:
+            self._kolejka_wejscia.release(req)
+        self._pociagi_na_szlaku_wejscie.discard(pociag_id)
+
+    def czekaj_na_wyjazd(self, env, pociag_id: int):
+        while len(self._pociagi_na_szlaku_wejscie) > 0:
+            yield env.timeout(0.05)
+        req = self._kolejka_wyjscia.request(priority=env.now)
+        yield req
+        self._uchwyty_wyjscia[pociag_id] = req
+        self._pociagi_na_szlaku_wyjscie.add(pociag_id)
+
+    def odnotuj_wyjazd_ze_szlaku(self, pociag_id: int):
+        self._pociagi_na_szlaku_wyjscie.discard(pociag_id)
+        req = self._uchwyty_wyjscia.pop(pociag_id, None)
+        if req is not None:
+            self._kolejka_wyjscia.release(req)
+
+
 class SimulationEngine:
     def __init__(self, config: Optional[SimConfig] = None):
         self.env = simpy.Environment()
@@ -110,10 +192,10 @@ class SimulationEngine:
         self.tor4 = simpy.PriorityResource(self.env, capacity=1)
         self.szlak568 = simpy.PriorityResource(self.env, capacity=1)
 
-        self.szlak_kopalnia = simpy.PriorityResource(self.env, capacity=1)
         self.kopalnia_tor = [
             simpy.PriorityResource(self.env, capacity=1) for _ in range(3)
         ]
+        self.szlak_kopalnia = SzlakKopalnia(self.env, len(self.kopalnia_tor))
 
         self.visual: Dict[int, dict] = {}
         self.trucks: List[TruckState] = []
@@ -128,6 +210,18 @@ class SimulationEngine:
         self.wagon_service_log: List[dict] = []
         self._last_timeline_t: float = -1.0
 
+        self.pasazerowie_na_peronie: Dict[str, List[Pasazer]] = {}
+        self.wszystkie_peron_klucze: List[str] = [
+            "L8_Polnoc", "L8_Poludnie", "L73_Polnoc", "L73_Poludnie",
+            "IC_Polnoc", "IC_Poludnie"
+        ]
+        for k in self.wszystkie_peron_klucze:
+            self.pasazerowie_na_peronie[k] = []
+        self.pasazer_counter = 0
+        self.pasazer_log: List[dict] = []
+        self.historia_liczby_pasazerow: List[dict] = []
+        self._last_pas_snapshot: float = -1.0
+
     @property
     def semafor_n_red(self):
         return len(self.glowica_polnocna.users) > 0
@@ -138,7 +232,11 @@ class SimulationEngine:
 
     @property
     def semafor_kop_red(self):
-        return len(self.szlak_kopalnia.users) > 0
+        return self.szlak_kopalnia.semafor_wejscie_red
+
+    @property
+    def semafor_kop_out_red(self):
+        return self.szlak_kopalnia.semafor_wyjscie_red
 
     @property
     def kopalnia_occupancy(self):
@@ -151,9 +249,17 @@ class SimulationEngine:
     def track_busy(self, name):
         res = {"tor1": self.tor1, "tor2": self.tor2,
                "tor3": self.tor3, "tor4": self.tor4,
-               "568": self.szlak568, "kop_szlak": self.szlak_kopalnia}
+               "568": self.szlak568}
         r = res.get(name)
-        return len(r.users) > 0 if r else False
+        if r is not None:
+            return len(r.users) > 0
+        if name == "kop_szlak":
+            return self.szlak_kopalnia.pociagi_w_drodze > 0
+        return False
+
+    def _t_clear(self, pociag: Pociag, t_segment: float) -> float:
+        fraction = min(0.95, 0.65 + pociag.liczba_wagonow * 0.025)
+        return t_segment * fraction
 
     def _czas(self, pociag: Pociag, bazowy: float) -> float:
         if pociag.typ == "Towarowy":
@@ -203,21 +309,183 @@ class SimulationEngine:
             "tor3": int(self.track_busy("tor3")),
             "tor4": int(self.track_busy("tor4")),
             "tor568": int(self.track_busy("568")),
-            "szlak_kopalni": int(self.track_busy("kop_szlak")),
+            "szlak_kopalni_wejscie": int(self.szlak_kopalnia.semafor_wejscie_red),
+            "szlak_kopalni_wyjscie": int(self.szlak_kopalnia.semafor_wyjscie_red),
+            "szlak_kopalni_pociagi": self.szlak_kopalnia.pociagi_w_drodze,
             "kop_0": int(self.kopalnia_occupancy[0]),
             "kop_1": int(self.kopalnia_occupancy[1]),
             "kop_2": int(self.kopalnia_occupancy[2]),
             "aktywne_pociagi": len(self.visual),
         })
 
-    def czas_wymiany_pasazerow(self, pociag):
-        if pociag.liczba_pasazerow == 0:
+    def _snapshot_pasazerowie(self):
+        t = int(self.env.now)
+        if t == self._last_pas_snapshot:
+            return
+        self._last_pas_snapshot = t
+        row = {"czas_min": t, "czas_str": f"{t//60:02d}:{t%60:02d}"}
+        for k in self.wszystkie_peron_klucze:
+            row[k] = len(self.pasazerowie_na_peronie.get(k, []))
+        self.historia_liczby_pasazerow.append(row)
+
+    def _klucz_peronu(self, linia: str, typ: str, kierunek_odjazdu: str) -> str:
+        if typ == "IC":
+            prefix = "IC"
+        elif linia == "L73":
+            prefix = "L73"
+        else:
+            prefix = "L8"
+        if kierunek_odjazdu in ("Polnoc", "Z_Polnocy"):
+            suffix = "Polnoc"
+        else:
+            suffix = "Poludnie"
+        return f"{prefix}_{suffix}"
+
+    def _generuj_pasazerow_dla_pociagu(self, pociag: Pociag):
+        if pociag.typ == "Towarowy" or pociag.kategoria == "Przelotowy":
+            return
+        cfg = self.config
+        opoznienie = max(0.0, self.env.now - pociag.czas_pojawienia)
+        mnoznik_opoznienia = 1.0 + (opoznienie / 10.0) * 0.15
+
+        if pociag.typ == "IC":
+            bazowa_intensywnosc = cfg.pasazerowie_per_min_ic
+        elif pociag.linia == "L73":
+            bazowa_intensywnosc = cfg.pasazerowie_per_min_l73
+        else:
+            bazowa_intensywnosc = cfg.pasazerowie_per_min_l8
+
+        liczba_pasazerow = int(bazowa_intensywnosc * 3.0 * mnoznik_opoznienia * random.uniform(0.5, 1.5))
+        liczba_pasazerow = max(0, liczba_pasazerow)
+
+        if pociag.kierunek == "Z_Polnocy":
+            kierunek_odjazdu = "Poludnie"
+        else:
+            kierunek_odjazdu = "Polnoc"
+
+        klucz = self._klucz_peronu(pociag.linia, pociag.typ, kierunek_odjazdu)
+
+        for _ in range(liczba_pasazerow):
+            self.pasazer_counter += 1
+            pas = Pasazer(
+                id=self.pasazer_counter,
+                linia=pociag.linia,
+                kierunek_odjazdu=kierunek_odjazdu,
+                czas_przybycia=self.env.now,
+                pociag_docelowy_id=pociag.id,
+            )
+            self.pasazerowie_na_peronie[klucz].append(pas)
+
+        return liczba_pasazerow
+
+    def _pasazerowie_wsiadaja(self, pociag: Pociag) -> int:
+        if pociag.typ == "Towarowy":
+            return 0
+        if pociag.kierunek == "Z_Polnocy":
+            kierunek_odjazdu = "Poludnie"
+        else:
+            kierunek_odjazdu = "Polnoc"
+
+        klucz = self._klucz_peronu(pociag.linia, pociag.typ, kierunek_odjazdu)
+        kolejka = self.pasazerowie_na_peronie.get(klucz, [])
+
+        wsiadajacy = [p for p in kolejka if p.pociag_docelowy_id == pociag.id]
+
+        pojemnosc_pociagu = pociag.liczba_wagonow * 60
+        ile_moze_wsiasc = max(0, pojemnosc_pociagu - pociag.pasazerowie_wsiadli)
+        wsiadajacy = wsiadajacy[:ile_moze_wsiasc]
+
+        for p in wsiadajacy:
+            p.wsiadl = True
+            p.czas_wyjazdu = self.env.now
+            self.pasazerowie_na_peronie[klucz].remove(p)
+            self.pasazer_log.append({
+                "pasazer_id": p.id,
+                "linia": p.linia,
+                "kierunek_odjazdu": p.kierunek_odjazdu,
+                "czas_przybycia": p.czas_przybycia,
+                "czas_wyjazdu": p.czas_wyjazdu,
+                "czas_oczekiwania": p.czas_wyjazdu - p.czas_przybycia,
+                "pociag_id": pociag.id,
+                "pociag_typ": pociag.typ,
+                "wsiadl": True,
+            })
+
+        pociag.pasazerowie_wsiadli += len(wsiadajacy)
+        return len(wsiadajacy)
+
+    def _generuj_przybywajacych_pasazerow_process(self, pociag: Pociag):
+        if pociag.typ == "Towarowy":
+            return
+        cfg = self.config
+        planowany_przyjazd = pociag.czas_pojawienia
+        okno_start = max(self.env.now, planowany_przyjazd - 30.0)
+        okno_koniec = planowany_przyjazd
+
+        if self.env.now >= okno_koniec:
+            return
+
+        if pociag.typ == "IC":
+            intensywnosc = cfg.pasazerowie_per_min_ic
+        elif pociag.linia == "L73":
+            intensywnosc = cfg.pasazerowie_per_min_l73
+        else:
+            intensywnosc = cfg.pasazerowie_per_min_l8
+
+        if pociag.kierunek == "Z_Polnocy":
+            kierunek_odjazdu = "Poludnie"
+        else:
+            kierunek_odjazdu = "Polnoc"
+
+        klucz = self._klucz_peronu(pociag.linia, pociag.typ, kierunek_odjazdu)
+
+        yield self.env.timeout(max(0, okno_start - self.env.now))
+
+        while self.env.now < okno_koniec:
+            sredni_interwal = 1.0 / max(0.01, intensywnosc)
+            interwal = random.expovariate(1.0 / sredni_interwal)
+            yield self.env.timeout(interwal)
+
+            if self.env.now >= okno_koniec:
+                break
+
+            self.pasazer_counter += 1
+            pas = Pasazer(
+                id=self.pasazer_counter,
+                linia=pociag.linia,
+                kierunek_odjazdu=kierunek_odjazdu,
+                czas_przybycia=self.env.now,
+                pociag_docelowy_id=pociag.id,
+            )
+            self.pasazerowie_na_peronie[klucz].append(pas)
+
+    def czas_wymiany_pasazerow(self, pociag: Pociag):
+        if pociag.typ == "Towarowy":
             return 0.5
-        mu = pociag.liczba_pasazerow * 1.2
+
+        opoznienie = max(0.0, self.env.now - pociag.czas_pojawienia)
+        mnoznik_opoznienia = 1.0 + (opoznienie / 10.0) * 0.2
+
+        if pociag.kierunek == "Z_Polnocy":
+            kierunek_odjazdu = "Poludnie"
+        else:
+            kierunek_odjazdu = "Polnoc"
+
+        klucz = self._klucz_peronu(pociag.linia, pociag.typ, kierunek_odjazdu)
+        czekajacy_na_tym_kursie = [
+            p for p in self.pasazerowie_na_peronie.get(klucz, [])
+            if p.pociag_docelowy_id == pociag.id
+        ]
+        liczba_oczekujacych = len(czekajacy_na_tym_kursie)
+
+        efektywna_liczba_pasazerow = max(pociag.liczba_pasazerow, liczba_oczekujacych)
+        efektywna_liczba_pasazerow = int(efektywna_liczba_pasazerow * mnoznik_opoznienia)
+
+        mu = max(1, efektywna_liczba_pasazerow) * 1.2
         sigma = 10
         czas = 0.5 + random.lognormvariate(
             math.log(mu), math.log(1 + sigma / mu)) / 60.0
-        return max(0.5, min(czas, 10.0))
+        return max(0.5, min(czas, 15.0))
 
     def _wait_with_visual(self, pociag, req, seg_wait, info_text=""):
         t_start = self.env.now
@@ -235,24 +503,23 @@ class SimulationEngine:
                         seg_approach, seg_wait, seg_enter, seg_at,
                         seg_wait_exit, seg_move, seg_cross, seg_depart):
         cfg = self.config
-        priorytet = PRIORYTET_IC if pociag.typ == "IC" else PRIORYTET_REGIO
         pociag.przydzielony_tor = tor_name
 
         t_app = self._czas(pociag, cfg.czas_podejscia)
         self._vs(pociag, seg_approach, t_app)
         yield self.env.timeout(t_app)
 
-        req_t = tor_res.request(priority=priorytet)
+        req_t = tor_res.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_t, seg_wait, f"Czeka na zwolnienie {tor_name}")
 
-        req_g = glowica_wjazd.request(priority=priorytet)
+        req_g = glowica_wjazd.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_g, seg_wait, "Czeka na wjazd przez glowice")
         self.loguj(pociag, f"Zajal glowice wjazdowa + {tor_name}")
 
         t_ent = self._czas(pociag, cfg.czas_wjazd_na_peron)
-        t_clear_in = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_ent)
+        t_clear_in = self._t_clear(pociag, t_ent)
 
         self._vs(pociag, seg_enter, t_ent)
         yield self.env.timeout(t_clear_in)
@@ -260,23 +527,26 @@ class SimulationEngine:
         yield self.env.timeout(t_ent - t_clear_in)
 
         pociag.czas_na_peronie = self.env.now
+        self._generuj_pasazerow_dla_pociagu(pociag)
         czas_wym = self.czas_wymiany_pasazerow(pociag)
+        self._pasazerowie_wsiadaja(pociag)
         pociag.czas_na_stacji += czas_wym
         self._vs(pociag, seg_at, czas_wym)
-        self.loguj(pociag, f"Na {tor_name}", f"Wymiana: {czas_wym:.1f} min")
+        self.loguj(pociag, f"Na {tor_name}", f"Wymiana: {czas_wym:.1f} min, wsiadlo: {pociag.pasazerowie_wsiadli}")
         yield self.env.timeout(czas_wym)
+        self._snapshot_pasazerowie()
 
         t_move = self._czas(pociag, cfg.czas_wyjazd_z_peronu) * 0.6
         self._vs(pociag, seg_move, t_move)
         self.loguj(pociag, f"Podjezdza pod semafor wyjazdowy z {tor_name}")
         yield self.env.timeout(t_move)
 
-        req_g2 = glowica_wyjazd.request(priority=priorytet)
+        req_g2 = glowica_wyjazd.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_g2, seg_wait_exit, "Czeka na glowice wyjazdowa")
 
         t_cross = self._czas(pociag, cfg.czas_wyjazd_z_peronu) * 0.4
-        t_clear_out = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_cross)
+        t_clear_out = self._t_clear(pociag, t_cross)
 
         self._vs(pociag, seg_cross, t_cross)
         self.loguj(pociag, f"Wyjezdza z {tor_name}")
@@ -362,9 +632,6 @@ class SimulationEngine:
 
     def _przejazd_568(self, pociag, direction):
         cfg = self.config
-        priorytet = (PRIORYTET_IC if pociag.typ == "IC"
-                     else PRIORYTET_TOWAROWY if pociag.typ == "Towarowy"
-                     else PRIORYTET_REGIO)
         pociag.przydzielony_tor = "568"
 
         if direction == "ns":
@@ -382,17 +649,17 @@ class SimulationEngine:
         self._vs(pociag, s_app, t_app)
         yield self.env.timeout(t_app)
 
-        req_568 = self.szlak568.request(priority=priorytet)
+        req_568 = self.szlak568.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_568, s_wait, "Czeka na wolny tor 568")
 
-        req_g = g_in.request(priority=priorytet)
+        req_g = g_in.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_g, s_wait, "Czeka na wjazd przez glowice")
         self.loguj(pociag, "Zajal glowice wjazdowa + 568")
 
         t_ent = self._czas(pociag, cfg.czas_wjazd_568)
-        t_clear_in = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_ent)
+        t_clear_in = self._t_clear(pociag, t_ent)
 
         self._vs(pociag, s_enter, t_ent)
         yield self.env.timeout(t_clear_in)
@@ -404,12 +671,12 @@ class SimulationEngine:
         self.loguj(pociag, "Przejazd 568 do semafora wyjazdowego")
         yield self.env.timeout(t_on)
 
-        req_g2 = g_out.request(priority=priorytet)
+        req_g2 = g_out.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_g2, s_wexit, "Czeka na glowice wyjazdowa")
 
         t_cross = self._czas(pociag, cfg.czas_wyjazd_568)
-        t_clear_out = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_cross)
+        t_clear_out = self._t_clear(pociag, t_cross)
 
         self._vs(pociag, s_cross, t_cross)
         self.loguj(pociag, "Wyjezdza z 568")
@@ -505,30 +772,28 @@ class SimulationEngine:
 
     def kopalnia_freight(self, pociag):
         cfg = self.config
-        priorytet = PRIORYTET_TOWAROWY
 
         t_app_s = self._czas(pociag, cfg.czas_podejscia)
         self._vs(pociag, "approach_s", t_app_s)
         yield self.env.timeout(t_app_s)
 
-        wolne = [i for i in range(3) if len(self.kopalnia_tor[i].users) == 0]
-        track_idx = wolne[0] if wolne else random.randint(0, 2)
-        req_kt = self.kopalnia_tor[track_idx].request(priority=priorytet)
+        wolne = [i for i in range(len(self.kopalnia_tor)) if len(self.kopalnia_tor[i].users) == 0]
+        track_idx = wolne[0] if wolne else 0
+        req_kt = self.kopalnia_tor[track_idx].request(priority=self.env.now)
+        self._vs(pociag, "wait_jct_s")
         yield from self._wait_with_visual(
             pociag, req_kt, "wait_jct_s", f"Rezerwuje Tor K{track_idx}")
 
-        req_branch = self.szlak_kopalnia.request(priority=priorytet)
-        yield from self._wait_with_visual(
-            pociag, req_branch, "wait_jct_s", "Czeka na szlak kopalni")
+        yield from self.szlak_kopalnia.wejdz(self.env, pociag, self.kopalnia_tor)
 
-        req_g_in = self.glowica_poludniowa.request(priority=priorytet)
+        req_g_in = self.glowica_poludniowa.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_g_in, "wait_jct_s", "Czeka na glowice S (dojazd kopalnia)")
 
         t_app_kop = self._czas(pociag, cfg.czas_podejscia_kopalnia)
         self._vs(pociag, "approach_kop", t_app_kop)
 
-        t_clear_in = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_app_kop)
+        t_clear_in = self._t_clear(pociag, t_app_kop)
         yield self.env.timeout(t_clear_in)
         self.glowica_poludniowa.release(req_g_in)
         yield self.env.timeout(t_app_kop - t_clear_in)
@@ -536,9 +801,9 @@ class SimulationEngine:
         t_doj = self._czas(pociag, cfg.czas_dojazd_kopalnia)
         self._vs(pociag, f"enter_kop_{track_idx}", t_doj)
 
-        t_clear_branch = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_doj)
+        t_clear_branch = self._t_clear(pociag, t_doj)
         yield self.env.timeout(t_clear_branch)
-        self.szlak_kopalnia.release(req_branch)
+        self.szlak_kopalnia.odnotuj_wjazd_na_teren(pociag.id)
         yield self.env.timeout(t_doj - t_clear_branch)
 
         akcja = "Rozladunek" if pociag.cel_kopalni == "rozladunek" else "Zaladunek"
@@ -546,16 +811,15 @@ class SimulationEngine:
         yield self.env.process(self._obsluz_wagony(pociag, track_idx))
         self.trucks = [t for t in self.trucks if t.track_idx != track_idx]
 
-        req_branch2 = self.szlak_kopalnia.request(priority=priorytet)
-        yield from self._wait_with_visual(
-            pociag, req_branch2, f"wait_exit_kop_{track_idx}",
-            "Czeka na szlak do wyjazdu z kopalni")
+        self._vs(pociag, f"wait_exit_kop_{track_idx}")
+        self.loguj(pociag, "Czeka na semafor wyjscia kopalni")
+        yield from self.szlak_kopalnia.czekaj_na_wyjazd(self.env, pociag.id)
 
         t_wyj = self._czas(pociag, cfg.czas_wyjazd_kopalnia)
         self._vs(pociag, f"exit_kop_{track_idx}", t_wyj)
         self.loguj(pociag, "Wyjezdza z kopalni na szlak dojazdowy")
 
-        t_clear_k = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_wyj)
+        t_clear_k = self._t_clear(pociag, t_wyj)
         yield self.env.timeout(t_clear_k)
         self.kopalnia_tor[track_idx].release(req_kt)
         yield self.env.timeout(t_wyj - t_clear_k)
@@ -564,44 +828,41 @@ class SimulationEngine:
         self._vs(pociag, "depart_kop", t_dep_kop)
         yield self.env.timeout(t_dep_kop)
 
-        req_g_out = self.glowica_poludniowa.request(priority=priorytet)
+        req_g_out = self.glowica_poludniowa.request(priority=self.env.now)
         yield from self._wait_with_visual(
             pociag, req_g_out, "wait_jct_s", "Czeka na glowice S (wyjazd)")
 
         if pociag.kierunek_po_kopalni == "Polnoc":
-            yield self.env.process(self._freight_after_kop_to_north(pociag, req_g_out, req_branch2))
+            yield self.env.process(self._freight_after_kop_to_north(pociag, req_g_out))
         else:
             t_dep_s = self._czas(pociag, cfg.czas_odjazdu)
             self._vs(pociag, "depart_s", t_dep_s)
 
-            t_clear_out = min(self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05), t_dep_s)
+            t_clear_out = self._t_clear(pociag, t_dep_s)
             yield self.env.timeout(t_clear_out)
 
-            self.szlak_kopalnia.release(req_branch2)
+            self.szlak_kopalnia.odnotuj_wyjazd_ze_szlaku(pociag.id)
             self.glowica_poludniowa.release(req_g_out)
 
             yield self.env.timeout(t_dep_s - t_clear_out)
             self._vs_remove(pociag)
 
-    def _freight_after_kop_to_north(self, pociag, req_g_s, req_branch_to_release=None):
+    def _freight_after_kop_to_north(self, pociag, req_g_s):
         cfg = self.config
-        priorytet = PRIORYTET_TOWAROWY
-        t_clear_base = self._czas(pociag, 0.15 + pociag.liczba_wagonow * 0.05)
 
         if len(self.szlak568.users) == 0:
             pociag.przydzielony_tor = "568"
-            req_568 = self.szlak568.request(priority=priorytet)
+            req_568 = self.szlak568.request(priority=self.env.now)
             yield req_568
 
             t_ent = self._czas(pociag, cfg.czas_wjazd_568)
             self._vs(pociag, "enter_568_from_s", t_ent)
 
-            t_clear_in = min(t_clear_base, t_ent)
+            t_clear_in = self._t_clear(pociag, t_ent)
             yield self.env.timeout(t_clear_in)
 
+            self.szlak_kopalnia.odnotuj_wyjazd_ze_szlaku(pociag.id)
             self.glowica_poludniowa.release(req_g_s)
-            if req_branch_to_release:
-                self.szlak_kopalnia.release(req_branch_to_release)
 
             yield self.env.timeout(t_ent - t_clear_in)
 
@@ -609,14 +870,14 @@ class SimulationEngine:
             self._vs(pociag, "on_568_sn", t_on)
             yield self.env.timeout(t_on)
 
-            req_g_n = self.glowica_polnocna.request(priority=priorytet)
+            req_g_n = self.glowica_polnocna.request(priority=self.env.now)
             yield from self._wait_with_visual(
                 pociag, req_g_n, "wait_568_exit_n", "Czeka na glowice N")
 
             t_ex = self._czas(pociag, cfg.czas_wyjazd_568)
             self._vs(pociag, "exit_568_to_n", t_ex)
 
-            t_clear_out = min(t_clear_base, t_ex)
+            t_clear_out = self._t_clear(pociag, t_ex)
             yield self.env.timeout(t_clear_out)
 
             self.szlak568.release(req_568)
@@ -626,33 +887,32 @@ class SimulationEngine:
         else:
             tn, tr = ("tor1", self.tor1) if len(self.tor1.users) == 0 else ("tor2", self.tor2)
             pociag.przydzielony_tor = tn
-            req_t = tr.request(priority=priorytet)
+            req_t = tr.request(priority=self.env.now)
             yield from self._wait_with_visual(
                 pociag, req_t, "wait_jct_s", f"Czeka na {tn}")
 
             t_ent = self._czas(pociag, cfg.czas_wjazd_na_peron)
             self._vs(pociag, f"enter_{tn}_from_s", t_ent)
 
-            t_clear_in = min(t_clear_base, t_ent)
+            t_clear_in = self._t_clear(pociag, t_ent)
             yield self.env.timeout(t_clear_in)
 
+            self.szlak_kopalnia.odnotuj_wyjazd_ze_szlaku(pociag.id)
             self.glowica_poludniowa.release(req_g_s)
-            if req_branch_to_release:
-                self.szlak_kopalnia.release(req_branch_to_release)
 
             yield self.env.timeout(t_ent - t_clear_in)
 
             self._vs(pociag, f"at_{tn}", 0.5)
             yield self.env.timeout(0.5)
 
-            req_g_n = self.glowica_polnocna.request(priority=priorytet)
+            req_g_n = self.glowica_polnocna.request(priority=self.env.now)
             yield from self._wait_with_visual(
                 pociag, req_g_n, f"wait_exit_{tn}", "Czeka na glowice N")
 
             t_ex = self._czas(pociag, cfg.czas_wyjazd_z_peronu)
             self._vs(pociag, f"exit_{tn}_to_n", t_ex)
 
-            t_clear_out = min(t_clear_base, t_ex)
+            t_clear_out = self._t_clear(pociag, t_ex)
             yield self.env.timeout(t_clear_out)
 
             tr.release(req_t)
@@ -666,6 +926,9 @@ class SimulationEngine:
         self._vs_remove(pociag)
 
     def obsluz_pociag(self, pociag):
+        if pociag.typ != "Towarowy" and pociag.kategoria != "Przelotowy":
+            self.env.process(self._generuj_przybywajacych_pasazerow_process(pociag))
+
         yield self.env.timeout(max(0, pociag.czas_pojawienia - self.env.now))
         pociag.czas_wjazdu = self.env.now
         self.loguj(pociag, "POJAWIL SIE")
@@ -704,6 +967,7 @@ class SimulationEngine:
         if len(self.all_trains) > 0 and len(self.pociagi_zakonczone) >= len(self.all_trains):
             self.sim_finished = True
             self._snapshot_timeline()
+            self._snapshot_pasazerowie()
             return
 
         target = self.env.now + dt
@@ -712,11 +976,18 @@ class SimulationEngine:
         except simpy.core.EmptySchedule:
             self.sim_finished = True
         self._snapshot_timeline()
+        self._snapshot_pasazerowie()
 
     def update_truck_progress(self):
         for truck in self.trucks:
             elapsed = self.env.now - truck.spawn_time
             truck.progress = min(1.0, elapsed / truck.duration)
+
+    def get_pasazerowie_summary(self) -> dict:
+        summary = {}
+        for k in self.wszystkie_peron_klucze:
+            summary[k] = len(self.pasazerowie_na_peronie.get(k, []))
+        return summary
 
     def export_to_excel(self, path: str):
         done = self.pociagi_zakonczone
@@ -729,6 +1000,7 @@ class SimulationEngine:
             "kierunek": p.kierunek,
             "liczba_wagonow": p.liczba_wagonow,
             "liczba_pasazerow": p.liczba_pasazerow,
+            "pasazerowie_wsiadli": p.pasazerowie_wsiadli,
             "czas_pojawienia_min": round(p.czas_pojawienia, 2),
             "planowany_odjazd_min": round(p.planowany_odjazd, 2),
             "czas_wjazdu_min": round(p.czas_wjazdu, 2),
@@ -772,13 +1044,33 @@ class SimulationEngine:
         util_rows = []
         if not df_timeline.empty:
             for col in ["gl_polnocna", "gl_poludniowa", "tor1", "tor2",
-                        "tor3", "tor4", "tor568", "szlak_kopalni",
-                        "kop_0", "kop_1", "kop_2"]:
+                        "tor3", "tor4", "tor568",
+                        "szlak_kopalni_wejscie", "szlak_kopalni_wyjscie",
+                        "szlak_kopalni_pociagi", "kop_0", "kop_1", "kop_2"]:
                 util_rows.append({
                     "zasob": col,
                     "wykorzystanie_proc": round(df_timeline[col].mean() * 100, 2),
                 })
         df_util = pd.DataFrame(util_rows)
+
+        df_pasazerowie = pd.DataFrame(self.pasazer_log)
+        df_pasazerowie_historia = pd.DataFrame(self.historia_liczby_pasazerow)
+
+        pas_przeplywy = []
+        if self.pasazer_log:
+            df_pas_tmp = pd.DataFrame(self.pasazer_log)
+            for linia in df_pas_tmp["linia"].unique():
+                for kier in df_pas_tmp["kierunek_odjazdu"].unique():
+                    sub = df_pas_tmp[(df_pas_tmp["linia"] == linia) & (df_pas_tmp["kierunek_odjazdu"] == kier)]
+                    if len(sub) > 0:
+                        pas_przeplywy.append({
+                            "linia": linia,
+                            "kierunek": kier,
+                            "liczba_pasazerow": len(sub),
+                            "sr_czas_oczekiwania_min": round(sub["czas_oczekiwania"].mean(), 2),
+                            "max_czas_oczekiwania_min": round(sub["czas_oczekiwania"].max(), 2),
+                        })
+        df_pas_przeplywy = pd.DataFrame(pas_przeplywy)
 
         with pd.ExcelWriter(path, engine="openpyxl") as w:
             df_trains.to_excel(w, sheet_name="pociagi", index=False)
@@ -787,6 +1079,12 @@ class SimulationEngine:
             df_timeline.to_excel(w, sheet_name="szereg_czasowy", index=False)
             df_wagons.to_excel(w, sheet_name="obsluga_wagonow", index=False)
             df_log.to_excel(w, sheet_name="log_zdarzen", index=False)
+            if not df_pasazerowie.empty:
+                df_pasazerowie.to_excel(w, sheet_name="pasazerowie_log", index=False)
+            if not df_pasazerowie_historia.empty:
+                df_pasazerowie_historia.to_excel(w, sheet_name="pasazerowie_historia", index=False)
+            if not df_pas_przeplywy.empty:
+                df_pas_przeplywy.to_excel(w, sheet_name="przeplywy_pasazerow", index=False)
 
         return path
 
@@ -901,13 +1199,21 @@ def wczytaj_rozklad(plik_l8: str, plik_l73: str) -> List[Pociag]:
 
     df = pd.read_excel(plik_l73, sheet_name="baza_pociagow_linia73", header=0)
     for _, row in df.iterrows():
+        if "kierunek" in df.columns:
+            kier = str(row["kierunek"]).strip()
+        elif "wartosc" in df.columns:
+            kier = str(row["wartosc"]).strip()
+        else:
+            kier = "Z_Poludnia"
+        if kier not in ("Z_Poludnia", "Z_Polnocy"):
+            kier = "Z_Poludnia"
         pociagi.append(Pociag(
             id=pid, typ=row["typPociagu"], kategoria=row["kategoria"],
             liczba_wagonow=int(row["liczbaWagonow"]),
             liczba_pasazerow=int(row["liczbaPasazerow"]),
             czas_pojawienia=czas_na_minuty(row["czasPojawienia"]),
             planowany_odjazd=czas_na_minuty(row["planowanyOdjazd"]),
-            kierunek="Z_Poludnia", linia="L73"))
+            kierunek=kier, linia="L73"))
         pid += 1
 
     return sorted(pociagi, key=lambda p: p.czas_pojawienia)
