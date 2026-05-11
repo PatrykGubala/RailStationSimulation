@@ -435,21 +435,21 @@ class Renderer:
         cap    = engine.szlak_kopalnia.pojemnosc
         kop_branch_mid_x = L.x_main + (L.kop_ox - 30 - L.x_main) // 3
         kop_branch_mid_y = L.y_jct_s + (L.kop_oy + 30 - L.y_jct_s) // 3
-        lbl_x = kop_branch_mid_x - 18
-        lbl_y = kop_branch_mid_y - 34
-        if do_kop > 0:
-            lbl = f">kop {do_kop}/{cap}"
-            surf = self.font_sm.render(lbl, True, TRACK_KOP_COLOR)
-            pygame.draw.rect(self.screen, (12, 15, 20),
-                             (lbl_x - 2, lbl_y - 1, surf.get_width() + 4, surf.get_height() + 2))
-            self.screen.blit(surf, (lbl_x, lbl_y))
-            lbl_y += surf.get_height() + 3
-        if z_kop > 0:
-            lbl = f"<st {z_kop}"
-            surf = self.font_sm.render(lbl, True, (200, 200, 100))
-            pygame.draw.rect(self.screen, (12, 15, 20),
-                             (lbl_x - 2, lbl_y - 1, surf.get_width() + 4, surf.get_height() + 2))
-            self.screen.blit(surf, (lbl_x, lbl_y))
+        lbl_x = kop_branch_mid_x + 90
+        lbl_y = kop_branch_mid_y - 18
+
+        col_do = TRACK_KOP_COLOR if do_kop > 0 else (80, 65, 40)
+        surf = self.font_sm.render(f">>kop {do_kop}/{cap}", True, col_do)
+        pygame.draw.rect(self.screen, (12, 15, 20),
+                         (lbl_x - 2, lbl_y - 1, surf.get_width() + 4, surf.get_height() + 2))
+        self.screen.blit(surf, (lbl_x, lbl_y))
+        lbl_y += surf.get_height() + 3
+
+        col_z = (200, 200, 100) if z_kop > 0 else (80, 80, 40)
+        surf = self.font_sm.render(f"<<kop {z_kop}/{cap}", True, col_z)
+        pygame.draw.rect(self.screen, (12, 15, 20),
+                         (lbl_x - 2, lbl_y - 1, surf.get_width() + 4, surf.get_height() + 2))
+        self.screen.blit(surf, (lbl_x, lbl_y))
 
     def _pos_angle_with_offset(self, path, t, offset_px):
         if not path: return (0, 0), 90.0
@@ -1006,7 +1006,7 @@ class Renderer:
         if export_info:
             self._pt(self.font_sm, export_info, x, y, ONTIME_COLOR)
             y += 20
-        self._pt(self.font_sm, "[X] Eksport  [R] Restart  [Q] Wyjscie", px + 80, py + ph - 30, LIGHT_GRAY)
+        self._pt(self.font_sm, "[X] Eksport  [E] Edytor  [R] Restart  [Q] Wyjscie", px + 60, py + ph - 30, LIGHT_GRAY)
 
     def _pt(self, font, text, x, y, color):
         self.screen.blit(font.render(text, True, color), (x, y))
@@ -1040,9 +1040,7 @@ class EditorPanel:
         self.font = pygame.font.SysFont("consolas", 13)
         self.font_lg = pygame.font.SysFont("consolas", 18, bold=True)
         self.fields = [
-            ("L8 z Poludnia (ilosc)", "l8_south_count", 1, 50, 1, False),
-            ("L8 z Polnocy (ilosc)", "l8_north_count", 1, 50, 1, False),
-            ("L73 (ilosc)", "l73_count", 0, 50, 1, False),
+            ("Random seed", "random_seed", 0, 9999, 1, False),
             ("Towarowe (ilosc)", "freight_count", 0, 50, 1, False),
             ("Godzina start", "start_hour", 0, 23, 1, False),
             ("Godzina koniec", "end_hour", 1, 24, 1, False),
@@ -1110,7 +1108,7 @@ class EditorPanel:
         ab = pygame.Rect(px + pw // 2 - 90, y, 180, 30)
         pygame.draw.rect(screen, (50, 120, 70), ab)
         pygame.draw.rect(screen, LIGHT_GRAY, ab, 1)
-        surf = self.font.render("[G] Zastosuj & Reset", True, WHITE)
+        surf = self.font.render("[G] Reset", True, WHITE)
         screen.blit(surf, (ab.x + (180 - surf.get_width()) // 2, y + 6))
 
     def handle_click(self, pos):
@@ -1131,12 +1129,16 @@ class EditorPanel:
 
 def _export_current(engine: SimulationEngine) -> str:
     out_dir = "wyniki_symulacji"
-    os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(out_dir, f"symulacja_{ts}.xlsx")
+    rozk_dir = os.path.join(out_dir, f"symulacja_{ts}")
+    os.makedirs(rozk_dir, exist_ok=True)
+    path = os.path.join(rozk_dir, f"symulacja_{ts}.xlsx")
     try:
         engine.export_to_excel(path)
-        return f"Zapisano: {path}"
+        from charts import export_rozklady, export_podsumowanie
+        export_rozklady(engine, rozk_dir)
+        export_podsumowanie(path, rozk_dir)
+        return f"Zapisano: {rozk_dir}"
     except Exception as e:
         return f"Blad eksportu: {e}"
 
@@ -1148,7 +1150,7 @@ def run_visualization():
     W = min(1600, info.current_w - 80)
     H = min(900, info.current_h - 80)
     screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
-    pygame.display.set_caption("Symulacja Sitkowka Nowiny + Kopalnia Trzuskawica")
+    pygame.display.set_caption("Symulacja Sitkowka Nowiny")
 
     clock = pygame.time.Clock()
     FPS = 60
@@ -1216,7 +1218,7 @@ def run_visualization():
                     paused = False
                     export_info = ""
                 elif event.key == pygame.K_g:
-                    engine = create_simulation(use_excel=False, config=config)
+                    engine = create_simulation(use_excel=True, config=config)
                     editor.visible = False
                     paused = False
                     export_info = ""
@@ -1273,7 +1275,7 @@ def run_visualization():
 
         editor.draw(screen)
 
-        if engine.sim_finished:
+        if engine.sim_finished and not editor.visible:
             renderer.draw_summary(engine, export_info)
 
         pygame.display.flip()

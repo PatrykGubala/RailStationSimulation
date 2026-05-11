@@ -17,7 +17,7 @@ class SimConfig:
     l8_south_count: int = 10
     l8_north_count: int = 6
     l73_count: int = 7
-    freight_count: int = 8
+    freight_count: int = 20
     start_hour: int = 6
     end_hour: int = 14
 
@@ -42,6 +42,8 @@ class SimConfig:
     pasazerowie_per_min_l8: float = 0.6
     pasazerowie_per_min_l73: float = 0.35
     pasazerowie_per_min_ic: float = 0.9
+
+    random_seed: int = 42
 
     def copy(self):
         import copy
@@ -208,6 +210,7 @@ class SimulationEngine:
 
         self.resource_timeline: List[dict] = []
         self.wagon_service_log: List[dict] = []
+        self.platform_exchange_log: List[dict] = []
         self._last_timeline_t: float = -1.0
 
         self.pasazerowie_na_peronie: Dict[str, List[Pasazer]] = {}
@@ -529,6 +532,13 @@ class SimulationEngine:
         pociag.czas_na_peronie = self.env.now
         self._generuj_pasazerow_dla_pociagu(pociag)
         czas_wym = self.czas_wymiany_pasazerow(pociag)
+        if pociag.typ != "Towarowy":
+            self.platform_exchange_log.append({
+                "pociag_id": pociag.id,
+                "typ": pociag.typ,
+                "linia": pociag.linia,
+                "czas_wymiany_min": czas_wym,
+            })
         self._pasazerowie_wsiadaja(pociag)
         pociag.czas_na_stacji += czas_wym
         self._vs(pociag, seg_at, czas_wym)
@@ -1158,7 +1168,7 @@ def generuj_pociagi_z_config(config: SimConfig) -> List[Pociag]:
 def generuj_pociagi_kopalnia_default(config: SimConfig) -> List[Pociag]:
     pociagi = []
     pid = 100
-    for t in _distribute_times(8, 360, 840):
+    for t in _distribute_times(config.freight_count, config.start_hour * 60, config.end_hour * 60):
         wagony = random.randint(3, 8)
         p = Pociag(
             id=pid, typ="Towarowy", kategoria="Kopalnia",
@@ -1219,43 +1229,18 @@ def wczytaj_rozklad(plik_l8: str, plik_l73: str) -> List[Pociag]:
     return sorted(pociagi, key=lambda p: p.czas_pojawienia)
 
 
-def dane_wbudowane() -> List[Pociag]:
-    pociagi = []
-    pid = 1
-    l8_pld = [(370, "Regio", "Zatrzymujacy", 2, 80, 373), (375, "IC", "Przelotowy", 6, 0, 375), (405, "Regio", "Zatrzymujacy", 3, 120, 409), (410, "IC", "Przelotowy", 7, 0, 410), (450, "Regio", "Zatrzymujacy", 2, 60, 453), (470, "IC", "Przelotowy", 6, 0, 470), (495, "Regio", "Zatrzymujacy", 4, 180, 499), (500, "IC", "Przelotowy", 8, 0, 500), (540, "Regio", "Zatrzymujacy", 2, 50, 543), (570, "IC", "Przelotowy", 6, 0, 570)]
-    for cp, typ, kat, wag, pas, po in l8_pld:
-        pociagi.append(Pociag(pid, typ, kat, wag, pas, cp, po, "Z_Poludnia", "L8"))
-        pid += 1
-    l8_pln = [(385, "Regio", "Przelotowy", 2, 0, 385), (435, "IC", "Zatrzymujacy", 6, 0, 438), (465, "Regio", "Przelotowy", 3, 120, 465), (490, "IC", "Zatrzymujacy", 7, 0, 493), (525, "Regio", "Przelotowy", 2, 60, 525), (560, "IC", "Zatrzymujacy", 6, 0, 563)]
-    for cp, typ, kat, wag, pas, po in l8_pln:
-        pociagi.append(Pociag(pid, typ, kat, wag, pas, cp, po, "Z_Polnocy", "L8"))
-        pid += 1
-    l73 = [(365, "Regio", "Zatrzymujacy", 2, 45, 368), (395, "Regio", "Zatrzymujacy", 2, 30, 398), (425, "Regio", "Zatrzymujacy", 3, 90, 428), (460, "Regio", "Zatrzymujacy", 2, 55, 463), (505, "Regio", "Zatrzymujacy", 2, 40, 508), (550, "Regio", "Zatrzymujacy", 2, 35, 553), (585, "Regio", "Zatrzymujacy", 3, 80, 588)]
-    for cp, typ, kat, wag, pas, po in l73:
-        pociagi.append(Pociag(pid, typ, kat, wag, pas, cp, po, "Z_Poludnia", "L73"))
-        pid += 1
-    return sorted(pociagi, key=lambda p: p.czas_pojawienia)
-
-
 def create_simulation(use_excel=True, config: SimConfig = None) -> SimulationEngine:
-    random.seed(RANDOM_SEED)
     if config is None:
         config = SimConfig()
+    random.seed(config.random_seed)
     engine = SimulationEngine(config=config)
 
     if use_excel:
-        try:
-            pociagi = wczytaj_rozklad("baza_pociagow_linia8.xlsx", "baza_pociagow_linia73.xlsx")
-            kop = generuj_pociagi_kopalnia_default(config)
-            for p in pociagi:
-                _assign_freight_direction(p, config)
-            pociagi = sorted(pociagi + kop, key=lambda p: p.czas_pojawienia)
-        except Exception:
-            pociagi = dane_wbudowane()
-            kop = generuj_pociagi_kopalnia_default(config)
-            for p in pociagi:
-                _assign_freight_direction(p, config)
-            pociagi = sorted(pociagi + kop, key=lambda p: p.czas_pojawienia)
+        pociagi = wczytaj_rozklad("baza_pociagow_linia8.xlsx", "baza_pociagow_linia73.xlsx")
+        kop = generuj_pociagi_kopalnia_default(config)
+        for p in pociagi:
+            _assign_freight_direction(p, config)
+        pociagi = sorted(pociagi + kop, key=lambda p: p.czas_pojawienia)
     else:
         pociagi = generuj_pociagi_z_config(config)
 

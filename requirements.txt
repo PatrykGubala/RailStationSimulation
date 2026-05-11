@@ -1,4 +1,6 @@
+numpy
 simpy
 pandas
 openpyxl
 pygame
+matplotlib
